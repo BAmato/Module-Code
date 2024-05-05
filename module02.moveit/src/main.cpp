@@ -14,11 +14,12 @@
 #include <ir_codes.h>
 #include <Chassis.h>
 
-
-#include <limits.h>
-#include <vector>
-
 #include <QTRSensors.h>   //Library for reflective sensor array
+
+#include <limits.h>       //Libraries for graphs,maps,vertices
+#include <vector>
+#include <map>
+
 
 #define LED_PIN 1
 #define LED_IR_CALIBRATE 0
@@ -28,8 +29,8 @@
 #define MAX_VERTICES 17
 
 struct Edge {
-    int to;
     int weight;
+    const char* name; // Name of the edge
 };
 
 struct Node {
@@ -39,6 +40,8 @@ struct Node {
 // Global array of nodes
 Node nodes[MAX_VERTICES];
 
+// Define a map to store edge information for each pair of vertices
+std::map<std::pair<int, int>, Edge> edgeMap;
 
 QTRSensors qtr;   //Makes global object for reflective sensor array
 
@@ -120,7 +123,7 @@ void setup()
   // Be sure to set your Serial Monitor appropriately
   Serial.begin(115200);
   while (!Serial);
-  Serial.println("\n\n-------BEGINNING SETUP-------");
+  Serial.println("\n\n***************--------BEGINNING SETUP----------***************");
   
   // TODO, Section 4.2: Initialize the chassis (which also initializes the motors)
   chassis.init();
@@ -135,7 +138,7 @@ void setup()
 
   pinMode(BUZZER_PIN, OUTPUT);
 
-  Serial.println("\n-----SETUP COMPLETE-------");
+  Serial.println("\n***************--------SETUP COMPLETE----------***************");
   idle();
   
 }
@@ -162,7 +165,7 @@ void setup()
 
 void QTR_init(){
 
-  Serial.println("\n\n-------BEGINNING CALIBRATION-------");
+  Serial.println("\n\n-------BEGINNING QTR CALIBRATION-------");
   // configure the sensors
   qtr.setTypeAnalog();
   qtr.setSensorPins((const uint8_t[]){A0, A1, A2, A3, A4}, SensorCount);    //A1 only receive 2.5V, unsure why
@@ -236,7 +239,7 @@ void QTR_init(){
 
 //----------------------------------DIJKSTRA ALGORITHM-----------------------------------------------------
 
-enum locations {
+enum POI {
   warehouse, utep, airport, ftbliss, alamo, lascruces, outlets,
   countryclub, franklin, sunland, executive
 };
@@ -246,22 +249,36 @@ enum streets {
 };
 
 enum intersections {
-  sect1, sect2, sect3, sect4, sect5, sect6
+  sect1 = 11, sect2 = 12, sect3 = 13, sect4 = 14, sect5 = 15, sect6 = 16
 };
 
 const char* vertexNames[] = {
-    "Warehouse", "UTEP", "Airport", "Ft Bliss", "Alamo", "Las Cruces", "Outlets",
-    "Country Club", "Franklin", "Sunland Park", "Executive",
-    "US-375", "US-54", "Spur", "Transmountain", "Doniphan", "Mesa", "I-10", "Dead End",
-    "Intersection 1", "Intersection 2", "Intersection 3", "Intersection 4", "Intersection 5", "Intersection 6"
+  "Warehouse", "UTEP", "Airport", "Ft Bliss", "Alamo", "Las Cruces", "Outlets",
+  "Country Club", "Franklin", "Sunland Park", "Executive",
+  "Intersection 1", "Intersection 2", "Intersection 3", "Intersection 4", "Intersection 5", "Intersection 6"
 };
 
-// Function to add edges to nodes
-void addEdge(int from, int to, int weight) {
-    nodes[from].edges.push_back({to, weight});
+const char* edgeNames[] = {
+  "US-375", "US-54", "Spur", "Transmountain", "Doniphan", "Mesa", "I-10", "Dead End"
+};
+
+// Function to add undirected edges to nodes
+void addUndirectedEdge(int from, int to, int weightIndex) {
+
+  // Retrieve the weight using the weight index
+  int weight = static_cast<int>(streets(weightIndex));   // Convert enum value to integer
+
+  // Retrieve the edge name using the weight index
+  const char* edgeName = edgeNames[weightIndex];
+
+  // Add edge information for the pair (from, to)
+  edgeMap[{from, to}] = {weight, edgeName};
+
+  // Add edge information for the pair (to, from) for undirected edge
+  edgeMap[{to, from}] = {weight, edgeName};
 }
 
-// Function to perform Dijkstra's algorithm
+// Dijkstra's algorithm
 std::vector<int> dijkstra(int src) {
     std::vector<int> dist(MAX_VERTICES, INT_MAX);
     std::vector<bool> visited(MAX_VERTICES, false);
@@ -270,17 +287,21 @@ std::vector<int> dijkstra(int src) {
     for (int i = 0; i < MAX_VERTICES - 1; i++) {
         int u = -1;
         for (int j = 0; j < MAX_VERTICES; j++) {
-            if (!visited[j] && (u == -1 || dist[j] < dist[u]))
+            if (!visited[j] && (u == -1 || dist[j] < dist[u])) {
                 u = j;
+            }
         }
 
         visited[u] = true;
 
-        for (const auto& edge : nodes[u].edges) {
-            int v = edge.to;
-            int weight = edge.weight;
-            if (!visited[v] && dist[u] != INT_MAX && dist[u] + weight < dist[v]) {
-                dist[v] = dist[u] + weight;
+        // Access all edges from vertex u
+        for (int v = 0; v < MAX_VERTICES; v++) {
+            // Check if there is an edge between u and v
+            if (edgeMap.find({u, v}) != edgeMap.end()) {
+                int weight = edgeMap[{u, v}].weight;
+                if (!visited[v] && dist[u] != INT_MAX && dist[u] + weight < dist[v]) {
+                    dist[v] = dist[u] + weight;
+                }
             }
         }
     }
@@ -289,43 +310,103 @@ std::vector<int> dijkstra(int src) {
 }
 
 void dijkstraInit(){
-  Serial.println("DIJSTRA INIT BEGIN");
-  // Initialize nodes
-    for (int i = 0; i < MAX_VERTICES; i++) {
-        nodes[i].id = i;
-    }
+  Serial.println("\n\n--------------DIJSTRA INIT BEGIN---------------");
 
-    // Define your edges here (edges represent streets connecting two POI (vertex))
-    // Streets that lead to POI are 1'
-    // Transmountain and I-10 are longest @ 3.5'
-    // All other are ~2'
-    // US-375 ~ 5'
-    addEdge(sect1, warehouse, us375);
-    addEdge(sect1, utep, deadend);
-    addEdge(sect1, sect2, us54);
-    addEdge(sect1, sect6, i10);
-    addEdge(sect2, airport, deadend);
-    addEdge(sect2, sect3, spur);
-    addEdge(sect3, alamo, deadend);
-    
+  // Initialize nodes
+  for (int i = 0; i < MAX_VERTICES; i++) {
+    if (i < MAX_VERTICES) {
+      nodes[i].id = static_cast<int>(POI(i)); // Convert enum value to integer
+    } else {
+      // Handle out-of-range vertices
+      Serial.print("Out-of-range vertice, assigning -1");
+      nodes[i].id = -1;
+    }
+  }
+
+  // Define your edges here (edges represent streets connecting two POI (vertex))
+  // Streets that lead to POI are 1'
+  // Transmountain and I-10 are longest @ 3.5'
+  // All other are ~2'
+  // US-375 ~ 5'
+  Serial.println("\n------------Adding Vertexes-------------");
+
+  addUndirectedEdge(sect1, warehouse, us375);
+  addUndirectedEdge(sect1, utep, deadend);
+  addUndirectedEdge(sect1, sect2, us54);
+  addUndirectedEdge(sect1, sect6, i10);
+  addUndirectedEdge(sect2, airport, deadend);
+  addUndirectedEdge(sect2, sect3, spur);
+  addUndirectedEdge(sect3, alamo, deadend);
+  Serial.print("Helllooooo");
+  for (const auto& node : nodes) {
+    if(node.edges.empty()){ Serial.print("Node "); Serial.print(node.id); Serial.print(" is null\n");}
+    else{
+      Serial.print("Node "); Serial.print(node.id); Serial.print(" is "); Serial.println(vertexNames[node.id]);
+    }
+  }
+  Serial.println("------------Vertexes Added-------------");
+  
+
+
+// ------------------------PRINTING NODES AND EDGES INFO-----------------------------//
+
+  Serial.println("\n------------Graph Info-------------");
+  for (const auto& node : nodes) {
+    if(!node.edges.empty()){
+    Serial.print("Node: "); Serial.print(node.id);
+    Serial.print(" Edge Count: "); Serial.println(node.edges.size());
+    }
+  }
+  Serial.println("------------Graph Info-------------");
+
+  Serial.println("\n------------Edge Info-------------");
+  // for (const auto& node : nodes) {
+  //   if(!node.edges.empty()){
+  //     Serial.print("Node: "); Serial.print(node.id);
+  //     for (const auto& edge : node.edges) {
+  //       Serial.print(" Edge: "); Serial.print(edgeNames[edge.to]);
+  //       Serial.print(" Weight: "); Serial.println(edge.weight);
+  //     }
+  //   }
+  // }
+  
+
+  // // Loop through the map and print values
+  // for (const auto& elem : edgeMap) {
+  //   Serial.print("In map");
+  //   const std::pair<int, int>& key = elem.first;
+  //   const Edge& edge = elem.second;
+  //   Serial.print("Edge between nodes ");
+  //   Serial.print(key.first);
+  //   Serial.print(" and ");
+  //   Serial.print(key.second);
+  //   Serial.print(": Weight = ");
+  //   Serial.print(edge.weight);
+  //   Serial.print(", Name = ");
+  //   Serial.println(edge.name);
+  // }
+  // Serial.println("------------Edge Info-------------");
   
   // Running Dijkstra's algorithm from vertex 0
   // USED FOR DEBUGGING
     
-    auto distances = dijkstra(0);
-    for (int i = 0; i < MAX_VERTICES; i++) {
-        if (distances[i] == INT_MAX) {
-            Serial.print("Vertex ");
-            Serial.print(vertexNames[i]);
-            Serial.println(" is unreachable");
-        } else {
-            Serial.print("Shortest distance to vertex ");
-            Serial.print(vertexNames[i]);
-            Serial.print(" is ");
-            Serial.println(distances[i]);
-        }
-    }
-    Serial.println("DIJKSTRA INIT COMPLETE");
+  int home = sect1;
+  auto distances = dijkstra(home);
+  for (int i = 0; i < MAX_VERTICES; i++) {
+      if (distances[i] == INT_MAX) {
+          Serial.print("Vertex ");
+          Serial.print(vertexNames[i]);
+          Serial.println(" is unreachable");
+      } else {
+          Serial.print("Shortest distance to ");
+          Serial.print(vertexNames[i]);
+          Serial.print(" from ");
+          Serial.print(vertexNames[home]); // Print the name of the starting vertex
+          Serial.print(" is ");
+          Serial.println(distances[i]);
+      }
+  }
+  Serial.println("DIJKSTRA INIT COMPLETE");
 }
 
 
