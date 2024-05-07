@@ -9,39 +9,60 @@
 
 #include <Arduino.h>
 #include <wpi-32u4-lib.h>
-#include <Adafruit_GFX.h>
+
 #include <IRdecoder.h>
 #include <ir_codes.h>
 #include <Chassis.h>
 
 #include <QTRSensors.h>   //Library for reflective sensor array
 
-#include <limits.h>       //Libraries for graphs,maps,vertices
+#include <limits.h>
 #include <vector>
 #include <map>
+#include <avr/pgmspace.h>  // Include the header for PROGMEM support
 
 
 #define LED_PIN 1
 #define LED_IR_CALIBRATE 0
 #define BUZZER_PIN 6
 
-// Define the maximum number of vertices as per your arena size (# of destinations)
 #define MAX_VERTICES 17
+#define INT_MAX 15
+
+#define MAX_EDGES 4
+
+// Define orientations as an enum for clarity
+enum Orientation {
+    NORTH = 0,  // 00
+    SOUTH = 1,  // 01
+    EAST = 2,   // 10
+    WEST = 3    // 11
+};
 
 struct Edge {
-    int weight;
+    int8_t to;        // Destination node index
+    uint8_t weight;    // Weight of the edge
     const char* name; // Name of the edge
+    Orientation orientation;  // Add orientation to the edge
 };
 
 struct Node {
-    int id;
-    std::vector<Edge> edges;
+    uint8_t id;
+    Edge edges[MAX_EDGES];  // Static array of edges
 };
-// Global array of nodes
-Node nodes[MAX_VERTICES];
 
-// Define a map to store edge information for each pair of vertices
-std::map<std::pair<int, int>, Edge> edgeMap;
+Node nodes[MAX_VERTICES];  // Global array of nodes
+
+
+// Global variables for node management
+bool visited[MAX_VERTICES] = {false};  // Tracks if a node has been visited
+uint8_t distances[MAX_VERTICES];           // Stores distances from the source node
+int8_t parents[MAX_VERTICES]; // Array to store the parent of each node
+int8_t currentRouteIndex = 1; // Index for the current node in the route array
+uint8_t target = 8;
+int route[MAX_VERTICES]; // Global route array
+
+bool readyStart = true;  //Flag to let robot start
 
 QTRSensors qtr;   //Makes global object for reflective sensor array
 
@@ -57,7 +78,7 @@ int16_t keyPress = decoder.getKeyCode();    //Making keypres global so it can be
 // Sets up the IR receiver/decoder object
 const uint8_t IR_DETECTOR_PIN = 1;
 IRDecoder decoder(IR_DETECTOR_PIN);
-volatile int baseSpeed = 10;
+volatile uint8_t baseSpeed = 10;
 
 volatile uint16_t leftLine;
 volatile uint16_t rightLine;
@@ -91,7 +112,7 @@ void setLED(bool value)
 }
 
 // Defines the robot states
-enum ROBOT_STATE {ROBOT_IDLE, ROBOT_DRIVE_FOR, ROBOT_LINING, ROBOT_DEBUG};
+enum ROBOT_STATE {ROBOT_IDLE, ROBOT_DRIVE_FOR, ROBOT_LINING, ROBOT_DEBUG, ROBOT_DELIVERY};
 ROBOT_STATE robotState = ROBOT_IDLE;
 
 // idle() stops the motors
@@ -109,9 +130,16 @@ void idle(void)
 }
 
 void QTR_init(void);
-
 void dijkstraInit(void);
-
+// void printGraphDetails(void); 
+// void printNodeNames(void);
+void dijkstra(int, int);
+int* makeRoute(int);
+void delivery(int);
+void evaluateMovement(void);
+bool checkIntersectionEvent(int16_t darkThreshold);
+void turn(float ang, float speed);
+void PID_control(void);
 /*
  * This is the standard setup function that is called when the board is rebooted
  * It is used to initialize anything that needs to be done once.
@@ -123,7 +151,7 @@ void setup()
   // Be sure to set your Serial Monitor appropriately
   Serial.begin(115200);
   while (!Serial);
-  Serial.println("\n\n***************--------BEGINNING SETUP----------***************");
+  Serial.println("\n\n-------BEGINNING SETUP-------");
   
   // TODO, Section 4.2: Initialize the chassis (which also initializes the motors)
   chassis.init();
@@ -135,10 +163,15 @@ void setup()
   decoder.init();
 
   dijkstraInit();
+  // printNodeNames();
+  // printGraphDetails();
+  dijkstra(0, target);
+  dijkstra(target, 0);
+  
 
   pinMode(BUZZER_PIN, OUTPUT);
 
-  Serial.println("\n***************--------SETUP COMPLETE----------***************");
+  Serial.println("\n*-*-*-*-*-*-*-*-*-*-*-*- SETUP COMPLETE -*-*-*-*-*-*-*-*-*-*-*-*-");
   idle();
   
 }
@@ -165,7 +198,7 @@ void setup()
 
 void QTR_init(){
 
-  Serial.println("\n\n-------BEGINNING QTR CALIBRATION-------");
+  Serial.println("\n\n-------BEGINNING CALIBRATION-------");
   // configure the sensors
   qtr.setTypeAnalog();
   qtr.setSensorPins((const uint8_t[]){A0, A1, A2, A3, A4}, SensorCount);    //A1 only receive 2.5V, unsure why
@@ -194,9 +227,9 @@ void QTR_init(){
 
   // print the calibration minimum values measured when emitters were on
 
-  int sensorCurr = 0;
-  int sensorMinMax = 0; //Max value from all min value readings
-  int sensorMaxMin = 1000; //Min value from all max value readings
+  uint16_t sensorCurr = 0;
+  uint16_t sensorMinMax = 0; //Max value from all min value readings
+  uint16_t sensorMaxMin = 1000; //Min value from all max value readings
 
   for (uint8_t i = 0; i < SensorCount; i++)
   {
@@ -252,164 +285,329 @@ enum intersections {
   sect1 = 11, sect2 = 12, sect3 = 13, sect4 = 14, sect5 = 15, sect6 = 16
 };
 
-const char* vertexNames[] = {
-  "Warehouse", "UTEP", "Airport", "Ft Bliss", "Alamo", "Las Cruces", "Outlets",
-  "Country Club", "Franklin", "Sunland Park", "Executive",
-  "Intersection 1", "Intersection 2", "Intersection 3", "Intersection 4", "Intersection 5", "Intersection 6"
-};
+// Define your vertex names as a PROGMEM array
+const char Warehouse[] PROGMEM = "Warehouse";
+const char Utep[] PROGMEM = "UTEP";
+const char Airport[] PROGMEM = "Airport";
+const char Ftbliss[] PROGMEM = "Ft Bliss";
+const char Alamo[] PROGMEM = "Alamo";
+const char Lascruces[] PROGMEM = "Las Cruces";
+const char Outlets[] PROGMEM = "Outlets";
+const char Countryclub[] PROGMEM = "Country Club";
+const char Franklin[] PROGMEM = "Franklin";
+const char Sunland[] PROGMEM = "Sunland Park";
+const char Executive[] PROGMEM = "Executive";
+const char Sect1[] PROGMEM = "Intersection 1";
+const char Sect2[] PROGMEM = "Intersection 2";
+const char Sect3[] PROGMEM = "Intersection 3";
+const char Sect4[] PROGMEM = "Intersection 4";
+const char Sect5[] PROGMEM = "Intersection 5";
+const char Sect6[] PROGMEM = "Intersection 6";
+
+// Create an array of pointers to the strings, also in PROGMEM
+const char* const vertexNames[] PROGMEM = {Warehouse, Utep, Airport, Ftbliss, Alamo, Lascruces, Outlets, Countryclub, Franklin, Sunland, Executive, Sect1, Sect2, Sect3, Sect4, Sect5, Sect6};
 
 const char* edgeNames[] = {
   "US-375", "US-54", "Spur", "Transmountain", "Doniphan", "Mesa", "I-10", "Dead End"
 };
 
-// Function to add undirected edges to nodes
-void addUndirectedEdge(int from, int to, int weightIndex) {
+// Helper function to add edges directly without checking for maximum edges
+void addEdge(int from, int to, int weight, const char* name, Orientation orientation) {
+    static int edgeIndices[MAX_VERTICES] = {0}; // Static array to track the current index for each node
 
-  // Retrieve the weight using the weight index
-  int weight = static_cast<int>(streets(weightIndex));   // Convert enum value to integer
+    // Add the edge directly to the node's edge array at the next available index
+    nodes[from].edges[edgeIndices[from]] = {to, weight, name, orientation};
 
-  // Retrieve the edge name using the weight index
-  const char* edgeName = edgeNames[weightIndex];
+    // // Debug output to confirm edge addition
+    // Serial.print("Edge added from Node ");
+    // Serial.print(from);
+    // Serial.print(" to Node ");
+    // Serial.print(to);
+    // Serial.print(" with weight ");
+    // Serial.print(weight);
+    // Serial.print(" and orientation ");
+    // Serial.println(orientation);
 
-  // Add edge information for the pair (from, to)
-  edgeMap[{from, to}] = {weight, edgeName};
-
-  // Add edge information for the pair (to, from) for undirected edge
-  edgeMap[{to, from}] = {weight, edgeName};
+    // Increment the index for the next edge addition
+    edgeIndices[from]++;
 }
 
-// Dijkstra's algorithm
-std::vector<int> dijkstra(int src) {
-    std::vector<int> dist(MAX_VERTICES, INT_MAX);
-    std::vector<bool> visited(MAX_VERTICES, false);
-    dist[src] = 0;
-
-    for (int i = 0; i < MAX_VERTICES - 1; i++) {
-        int u = -1;
-        for (int j = 0; j < MAX_VERTICES; j++) {
-            if (!visited[j] && (u == -1 || dist[j] < dist[u])) {
-                u = j;
-            }
-        }
-
-        visited[u] = true;
-
-        // Access all edges from vertex u
-        for (int v = 0; v < MAX_VERTICES; v++) {
-            // Check if there is an edge between u and v
-            if (edgeMap.find({u, v}) != edgeMap.end()) {
-                int weight = edgeMap[{u, v}].weight;
-                if (!visited[v] && dist[u] != INT_MAX && dist[u] + weight < dist[v]) {
-                    dist[v] = dist[u] + weight;
-                }
-            }
-        }
-    }
-
-    return dist;
-}
-
-void dijkstraInit(){
-  Serial.println("\n\n--------------DIJSTRA INIT BEGIN---------------");
+void dijkstraInit() {
+  Serial.println("\n\n--------------DIJSTRA INIT BEGIN---------------\n");
 
   // Initialize nodes
-  for (int i = 0; i < MAX_VERTICES; i++) {
-    if (i < MAX_VERTICES) {
-      nodes[i].id = static_cast<int>(POI(i)); // Convert enum value to integer
-    } else {
-      // Handle out-of-range vertices
-      Serial.print("Out-of-range vertice, assigning -1");
-      nodes[i].id = -1;
-    }
+  for (uint8_t i = 0; i < MAX_VERTICES; i++) {
+      nodes[i].id = static_cast<int>(POI(i)); // Convert enum value to int
   }
 
-  // Define your edges here (edges represent streets connecting two POI (vertex))
-  // Streets that lead to POI are 1'
-  // Transmountain and I-10 are longest @ 3.5'
-  // All other are ~2'
-  // US-375 ~ 5'
-  Serial.println("\n------------Adding Vertexes-------------");
+  Serial.println("------------Initializing Vertexes and Edges-------------");
+  // Define edges (edges represent streets connecting two POI (vertex))
+  addEdge(0, 11, 5, "US-375", EAST);
+  addEdge(1, 11, 1, "Dead End", SOUTH);
+  addEdge(2, 12, 1, "Dead End", EAST);
+  addEdge(3, 13, 1, "Dead End", EAST);
+  addEdge(4, 13, 1, "Dead End", NORTH);
+  addEdge(5, 14, 1, "Dead End", NORTH);
+  addEdge(6, 14, 1, "Dead End", WEST);
+  addEdge(7, 15, 1, "Dead End", WEST);
+  addEdge(8, 15, 1, "Dead End", EAST);
+  addEdge(9, 16, 1, "Dead End", WEST);
+  addEdge(10, 16, 1, "Dead End", SOUTH);
+  addEdge(11, 12, 2, "US-54", SOUTH);
+  addEdge(11, 0, 5, "US-375", WEST);
+  addEdge(11, 1, 1, "Dead End", NORTH);
+  addEdge(11, 16, 3, "I-10", EAST);
+  addEdge(12, 13, 2, "Spur", SOUTH);
+  addEdge(12, 2, 1, "Dead End", WEST);
+  addEdge(12, 11, 2, "US-54", NORTH);
+  addEdge(13, 12, 2, "Spur", NORTH);
+  addEdge(13, 3, 1, "Dead End", WEST);
+  addEdge(13, 4, 1, "Dead End", SOUTH);
+  addEdge(13, 14, 3, "Transmountain", EAST);
+  addEdge(14, 5, 1, "Dead End", SOUTH);
+  addEdge(14, 6, 1, "Dead End", EAST);
+  addEdge(14, 15, 2, "Doniphan", NORTH);
+  addEdge(14, 13, 3, "Transmountain", WEST);
+  addEdge(15, 14, 2, "Doniphan", SOUTH);
+  addEdge(15, 8, 1, "Dead End", WEST);
+  addEdge(15, 7, 1, "Dead End", EAST);
+  addEdge(15, 16, 2, "Mesa", NORTH);
+  addEdge(16, 15, 2, "Mesa", SOUTH);
+  addEdge(16, 9, 1, "Dead End", EAST);
+  addEdge(16, 11, 3, "I-10", WEST);
+  addEdge(16, 10, 1, "Dead End", NORTH);
 
-  addUndirectedEdge(sect1, warehouse, us375);
-  addUndirectedEdge(sect1, utep, deadend);
-  addUndirectedEdge(sect1, sect2, us54);
-  addUndirectedEdge(sect1, sect6, i10);
-  addUndirectedEdge(sect2, airport, deadend);
-  addUndirectedEdge(sect2, sect3, spur);
-  addUndirectedEdge(sect3, alamo, deadend);
-  Serial.print("Helllooooo");
-  for (const auto& node : nodes) {
-    if(node.edges.empty()){ Serial.print("Node "); Serial.print(node.id); Serial.print(" is null\n");}
-    else{
-      Serial.print("Node "); Serial.print(node.id); Serial.print(" is "); Serial.println(vertexNames[node.id]);
-    }
+  Serial.println("------------Vertexes and Edges Initialized-------------");
+
+  Serial.println("\n--------------DIJSTRA INIT COMPLETE---------------\n");
+}
+
+void dijkstra(int src, int target) {
+  // Reset distances and visited status for all vertices
+  for (uint8_t i = 0; i < MAX_VERTICES; i++) {
+      distances[i] = INT_MAX;
+      visited[i] = false;
+      parents[i] = -1;
   }
-  Serial.println("------------Vertexes Added-------------");
-  
 
+  distances[src] = 0; // Starting point distance is zero
+  uint8_t stepCount = 0;
 
-// ------------------------PRINTING NODES AND EDGES INFO-----------------------------//
+  while (true) {
+      uint8_t minDistance = INT_MAX, u = -1;
 
-  Serial.println("\n------------Graph Info-------------");
-  for (const auto& node : nodes) {
-    if(!node.edges.empty()){
-    Serial.print("Node: "); Serial.print(node.id);
-    Serial.print(" Edge Count: "); Serial.println(node.edges.size());
-    }
-  }
-  Serial.println("------------Graph Info-------------");
+      // Find the unvisited vertex with the smallest distance
+      for (uint8_t v = 0; v < MAX_VERTICES; v++) {
+          if (!visited[v] && distances[v] < minDistance) {
+              minDistance = distances[v];
+              u = v;
+          }
+      }
 
-  Serial.println("\n------------Edge Info-------------");
-  // for (const auto& node : nodes) {
-  //   if(!node.edges.empty()){
-  //     Serial.print("Node: "); Serial.print(node.id);
-  //     for (const auto& edge : node.edges) {
-  //       Serial.print(" Edge: "); Serial.print(edgeNames[edge.to]);
-  //       Serial.print(" Weight: "); Serial.println(edge.weight);
-  //     }
-  //   }
-  // }
-  
+      if (u == -1) break; // No reachable vertices remain unvisited
 
-  // // Loop through the map and print values
-  // for (const auto& elem : edgeMap) {
-  //   Serial.print("In map");
-  //   const std::pair<int, int>& key = elem.first;
-  //   const Edge& edge = elem.second;
-  //   Serial.print("Edge between nodes ");
-  //   Serial.print(key.first);
-  //   Serial.print(" and ");
-  //   Serial.print(key.second);
-  //   Serial.print(": Weight = ");
-  //   Serial.print(edge.weight);
-  //   Serial.print(", Name = ");
-  //   Serial.println(edge.name);
-  // }
-  // Serial.println("------------Edge Info-------------");
-  
-  // Running Dijkstra's algorithm from vertex 0
-  // USED FOR DEBUGGING
-    
-  int home = sect1;
-  auto distances = dijkstra(home);
-  for (int i = 0; i < MAX_VERTICES; i++) {
-      if (distances[i] == INT_MAX) {
-          Serial.print("Vertex ");
-          Serial.print(vertexNames[i]);
-          Serial.println(" is unreachable");
-      } else {
-          Serial.print("Shortest distance to ");
-          Serial.print(vertexNames[i]);
-          Serial.print(" from ");
-          Serial.print(vertexNames[home]); // Print the name of the starting vertex
-          Serial.print(" is ");
-          Serial.println(distances[i]);
+      visited[u] = true; // Mark the vertex as visited
+
+      // Target reached, begin to construct the route
+      if (u == target) {
+          for (int v = target; v != -1; v = parents[v]) {
+              route[stepCount++] = v;
+          }
+
+          // Reverse the route to start from the source
+          for (int i = 0; i < stepCount / 2; i++) {
+              uint8_t temp = route[i];
+              route[i] = route[stepCount - 1 - i];
+              route[stepCount - 1 - i] = temp;
+          }
+
+          // Print the route
+          Serial.println("\n--------------Route Map----------------");
+          Serial.print("Best Route To Node ");
+          Serial.print(target);
+          Serial.println(": ");
+          for (uint8_t i = 0; i < stepCount; i++) {
+              Serial.print(route[i]);
+              if (i < stepCount - 1) {
+                  Serial.print(" -> ");
+              }
+          }
+          Serial.println("\n--------------Route Map----------------");
+          return; // Exit after route is built
+      }
+
+      // Update the distances to the neighboring vertices
+      for (uint8_t j = 0; j < MAX_EDGES; j++) {
+          if (nodes[u].edges[j].to != -1) { // Ensure the edge is valid
+              uint8_t v = nodes[u].edges[j].to;
+              uint8_t weight = nodes[u].edges[j].weight;
+              if (distances[u] + weight < distances[v]) {
+                  parents[v] = u;
+                  distances[v] = distances[u] + weight;
+              }
+          }
       }
   }
-  Serial.println("DIJKSTRA INIT COMPLETE");
+}
+
+void delivery(int target) {
+    Serial.println("------------DELIVERY---------");
+    robotState = ROBOT_DELIVERY;
+    if (!readyStart) {
+        Serial.println("ROBOT READY STATUS FALSE");
+        robotState = ROBOT_IDLE;
+        return;
+    }
+
+    // Start from the first node in the route after the starting point
+    currentRouteIndex = 1; // Assuming the route array is correctly set up by `dijkstra`
+
+    while (route[currentRouteIndex] != -1) { // Continue until the end of the route
+        evaluateMovement(); // Moves the robot to the next node
+        if (route[currentRouteIndex] == target) {
+            Serial.println("Delivery Complete.");
+            break; // Stop if target reached
+        }
+        currentRouteIndex++;
+    }
+    robotState = ROBOT_IDLE;
+    Serial.println("------------DELIVERY EXIT---------");
 }
 
 
+void evaluateMovement() {
+    if (route[currentRouteIndex] == -1) {
+        Serial.println("Route completed or not set up.");
+        return;
+    }
+
+    int8_t currentNodeIndex = route[currentRouteIndex];
+    int8_t nextNodeIndex = route[currentRouteIndex + 1];  // Next node index
+
+    // Check if there is no next node, indicating the end of the route
+    if (nextNodeIndex == -1) {
+        Serial.println("Reached the destination.");
+        robotState = ROBOT_IDLE;
+        return;
+    }
+
+    int8_t currentOrientation = -1;
+    int8_t nextOrientation = -1;
+
+    // Find the next orientation by examining the edges from the current node
+    for (uint8_t i = 0; i < MAX_EDGES; i++) {
+        if (nodes[currentNodeIndex].edges[i].to == nextNodeIndex) {
+            nextOrientation = nodes[currentNodeIndex].edges[i].orientation;
+            Serial.print("Next orientation from Node ");
+            Serial.print(currentNodeIndex);
+            Serial.print(" to Node ");
+            Serial.print(nextNodeIndex);
+            Serial.print(" is ");
+            Serial.println(nextOrientation);
+            break;
+        }
+    }
+
+    // Determine the current orientation if not the first node in the route
+    if (currentRouteIndex > 0) {
+        int previousNodeIndex = route[currentRouteIndex - 1];
+        for (int i = 0; i < MAX_EDGES; i++) {
+            if (nodes[previousNodeIndex].edges[i].to == currentNodeIndex) {
+                currentOrientation = nodes[previousNodeIndex].edges[i].orientation;
+                Serial.print("Current orientation from Node ");
+                Serial.print(previousNodeIndex);
+                Serial.print(" to Node ");
+                Serial.print(currentNodeIndex);
+                Serial.print(" is ");
+                Serial.println(currentOrientation);
+                break;
+            }
+        }
+    }
+
+    // Output detailed debug information before deciding movement
+    Serial.print("Evaluating movement from Node ");
+    Serial.print(currentNodeIndex);
+    Serial.print(" to Node ");
+    Serial.print(nextNodeIndex);
+    Serial.println("...");
+
+    // Decide movement based on the orientations
+    if (currentOrientation == nextOrientation) {
+        Serial.println("Continuing straight.");
+        PID_control();  // Keeps the robot moving straight along the path
+    } else {
+        Serial.println("Adjusting route with a turn.");
+        // Example logic for determining turn angle
+        if ((currentOrientation == EAST && nextOrientation == SOUTH) ||
+            (currentOrientation == NORTH && nextOrientation == EAST)) {
+              Serial.println("Adjusting route with a right turn.");
+            chassis.turnFor(-90, 90, true);  // Turning right
+            
+        } else {
+          //Serial.println("Adjusting route with a left turn.");
+            chassis.turnFor(90, 90, true);  // Turning left
+        }
+    }
+  currentRouteIndex++;
+  if(route[currentRouteIndex] == 0 && currentRouteIndex > 0){
+    robotState == ROBOT_IDLE;
+    chassis.idle();
+  } 
+}
+
+
+
+// void printGraphDetails() {
+//   char buffer[20];  // Buffer to hold vertex names
+
+//   Serial.println("\n------------Graph Details-------------");
+//   for (uint8_t i = 0; i < MAX_VERTICES; i++) {
+//       bool hasEdges = false;
+
+//       strcpy_P(buffer, (char*)pgm_read_word(&(vertexNames[nodes[i].id])));  // Retrieve the node name from PROGMEM
+//       Serial.print("Node ");
+//       Serial.print(i);
+//       Serial.print(" (");
+//       Serial.print(buffer);
+//       Serial.println(") has the following edges:");
+
+//       for (uint8_t j = 0; j < MAX_EDGES; j++) {
+//           if (nodes[i].edges[j].to != -1) {  // Assuming -1 indicates an invalid or uninitialized node
+//               if (!hasEdges) {
+//                   hasEdges = true;  // Only print edges if at least one is valid
+//               }
+//               strcpy_P(buffer, (char*)pgm_read_word(&(vertexNames[nodes[i].edges[j].to])));  // Retrieve the to node name
+//               Serial.print("  -> Edge to ");
+//               Serial.print(buffer);
+//               Serial.print(" (");
+//               Serial.print(nodes[i].edges[j].name);
+//               Serial.print(") with weight ");
+//               Serial.println(nodes[i].edges[j].weight);
+//           }
+//       }
+//       if (!hasEdges) {
+//           Serial.println("  No valid edges.");
+//       }
+//   }
+//   Serial.println("------------End of Graph Details-------------");
+// }
+
+
+// void printNodeNames() {
+//     char buffer[20];  // Ensure this is large enough for the largest string
+
+//     Serial.println("------------Node Names-------------");
+//     for (uint8_t i = 0; i < MAX_VERTICES; i++) {
+//         strcpy_P(buffer, (char*)pgm_read_word(&(vertexNames[nodes[i].id])));  // Copy the string from PROGMEM to buffer
+
+//         Serial.print("Node ");
+//         Serial.print(i);
+//         Serial.print(" is ");
+//         Serial.println(buffer);
+//     }
+//     Serial.println("------------End of Node Names-------------");
+// }
 
 //--------------------------------------------------------------------------------------------
 // A helper command to drive a set distance
@@ -428,16 +626,6 @@ void drive(int distance, int speed)
   chassis.driveFor(distance, speed);
   
 }
-
-// void driveForward(int speed)
-// {
-//   chassis.setWheelSpeeds(speed,speed);
-// }
-
-// void driveReverse(int speed)
-// {
-//   chassis.setWheelSpeeds(-speed, -speed);
-// }
 
 void forward_movement(int speedA, int speedB){
   if (speedA < 0){
@@ -462,7 +650,7 @@ void PID_control(){
   // int position = (sensorValues[0] * 0 + sensorValues[1] * 1000 + sensorValues[2] * 2000 + sensorValues[3] * 3000 
   // + sensorValues[4] * 4000 + sensorValues[5] * 5000 ) / (sensorValues[0] + sensorValues[1] + sensorValues[2] +
   // sensorValues[3] + sensorValues[4] + sensorValues[5]);
-  int error = (2000 - positionLine);
+  uint16_t error = (2000 - positionLine);
 
   // error = 0     NO NEED FOR CORRECTION, POS AT MIDDLE 
   // error < 0     POSITION NEAR RIGHT OF ARRAY (sensorValue[7])
@@ -473,10 +661,10 @@ void PID_control(){
   D = error - lastError;
   lastError = error;
 
-  int motorSpeedChange = P * Kp + I * Ki + D * Kd; //Need values between [0,255]
+  int8_t motorSpeedChange = P * Kp + I * Ki + D * Kd; //Need values between [0,255]
 
-  int motorSpeedA = baseSpeed - (motorSpeedChange/10);
-  int motorSpeedB = baseSpeed + (motorSpeedChange/10);
+  int8_t motorSpeedA = baseSpeed - (motorSpeedChange/10);
+  int8_t motorSpeedB = baseSpeed + (motorSpeedChange/10);
 
   if(motorSpeedA > maxspeedA){
     motorSpeedA = maxspeedA;
@@ -490,81 +678,82 @@ void PID_control(){
   if(motorSpeedB < 0){
     motorSpeedB = 0;
   }
-  Serial.print("MotASpd: ");
-  Serial.print(motorSpeedA);
-  Serial.print("\tMotBSpd: ");
-  Serial.print(motorSpeedB);
+  // Serial.print("MotASpd: ");
+  // Serial.print(motorSpeedA);
+  // Serial.print("\tMotBSpd: ");
+  // Serial.print(motorSpeedB);
 
-  Serial.print("A0: ");
-  Serial.print(sensorValues[0]);
-  Serial.print("  A1: ");
-  Serial.print(sensorValues[1]);
-  Serial.print("  A2: ");
-  Serial.print(sensorValues[2]);
-  Serial.print("  A3: ");
-  Serial.print(sensorValues[3]);
-  Serial.print("  A4: ");
-  Serial.print(sensorValues[4]);
-  // Serial.print("  A5: ");
-  // Serial.print(sensorValues[5]);
-  Serial.print("  Pos: ");
-  Serial.print(qtr.readLineBlack(sensorValues));
+  // Serial.print("A0: ");
+  // Serial.print(sensorValues[0]);
+  // Serial.print("  A1: ");
+  // Serial.print(sensorValues[1]);
+  // Serial.print("  A2: ");
+  // Serial.print(sensorValues[2]);
+  // Serial.print("  A3: ");
+  // Serial.print(sensorValues[3]);
+  // Serial.print("  A4: ");
+  // Serial.print(sensorValues[4]);
+  // // Serial.print("  A5: ");
+  // // Serial.print(sensorValues[5]);
+  // Serial.print("  Pos: ");
+  // Serial.print(qtr.readLineBlack(sensorValues));
 
-  Serial.print(" Err: ");
-  Serial.print(error);
-  Serial.print(" Spd_Chng: ");
-  Serial.println(motorSpeedChange);
+  // Serial.print(" Err: ");
+  // Serial.print(error);
+  // Serial.print(" Spd_Chng: ");
+  // Serial.println(motorSpeedChange);
 
   forward_movement(motorSpeedA, motorSpeedB);
 }
 
-void debug(){
+// void debug(){
 
-  /*DIRECT VALUES PULLED FROM SENSOR*/
-  // Serial.print("A0: ");
-  // Serial.print(analogRead(A0));
-  // Serial.print("  A1: ");
-  // Serial.print(analogRead(A1));
-  // Serial.print("  A2: ");
-  // Serial.print(analogRead(A2));
-  // Serial.print("  A3: ");
-  // Serial.print(analogRead(A3));
-  // Serial.print("  A4: ");
-  // Serial.print(analogRead(A4));
-  // Serial.print("  A5: ");
-  // Serial.println(analogRead(A5));
+//   /*DIRECT VALUES PULLED FROM SENSOR*/
+//   // Serial.print("A0: ");
+//   // Serial.print(analogRead(A0));
+//   // Serial.print("  A1: ");
+//   // Serial.print(analogRead(A1));
+//   // Serial.print("  A2: ");
+//   // Serial.print(analogRead(A2));
+//   // Serial.print("  A3: ");
+//   // Serial.print(analogRead(A3));
+//   // Serial.print("  A4: ");
+//   // Serial.print(analogRead(A4));
+//   // Serial.print("  A5: ");
+//   // Serial.println(analogRead(A5));
 
 
-  /*VALUES PULLED FROM QTR LIBRARY FUNCTION FOR ANALOG READ*/
-  Serial.print("A0: ");
-  Serial.print(sensorValues[0]);
-  Serial.print("  A1: ");
-  Serial.print(sensorValues[1]);
-  Serial.print("  A2: ");
-  Serial.print(sensorValues[2]);
-  Serial.print("  A3: ");
-  Serial.print(sensorValues[3]);
-  Serial.print("  A4: ");
-  Serial.print(sensorValues[4]);
-  Serial.print("  A5: ");
-  Serial.print(sensorValues[5]);
-  Serial.print("Position: ");
-  Serial.println(qtr.readLineBlack(sensorValues));
+//   /*VALUES PULLED FROM QTR LIBRARY FUNCTION FOR ANALOG READ*/
+//   Serial.print("A0: ");
+//   Serial.print(sensorValues[0]);
+//   Serial.print("  A1: ");
+//   Serial.print(sensorValues[1]);
+//   Serial.print("  A2: ");
+//   Serial.print(sensorValues[2]);
+//   Serial.print("  A3: ");
+//   Serial.print(sensorValues[3]);
+//   Serial.print("  A4: ");
+//   Serial.print(sensorValues[4]);
+//   Serial.print("  A5: ");
+//   Serial.print(sensorValues[5]);
+//   Serial.print("Position: ");
+//   Serial.println(qtr.readLineBlack(sensorValues));
 
   
 
-  robotState = ROBOT_DEBUG;
-}
+//   robotState = ROBOT_DEBUG;
+// }
 
 // A helper function to turn a set angle
 void turn(float ang, float speed)
 {
   setLED(HIGH);
-  robotState = ROBOT_DRIVE_FOR;
+  if(robotState = ROBOT_DELIVERY) chassis.turnFor(ang, speed);
+  else{
+    robotState = ROBOT_DRIVE_FOR;
+    chassis.turnFor(ang, speed);
+  }
   
-  // TODO, Section 6.1: Make a call to chassis.turnFor()
-
-  chassis.turnFor(ang, speed);
 }
 
 // TODO, Section 6.1: Declare function handleMotionComplete(), which calls idle()
@@ -581,8 +770,8 @@ void beginLineFollowing(){
 }
 
 //Function to handle the Line Following
-void handleLineFollow(int speed){
-  Serial.println("ENTERING UNUSED FUNCTION: handleLineFollow()");
+// void handleLineFollow(int speed){
+//   Serial.println("ENTERING UNUSED FUNCTION: handleLineFollow()");
   
   // int whiteMin = 120;
   // int whiteMax = 220;
@@ -643,7 +832,7 @@ void handleLineFollow(int speed){
   //     chassis.setTwist(speed, -10);   // Turn Right
   // }
 
-}
+//}
 
 void beep(boolean input) {
   // Play a tone on the buzzer pin
@@ -670,16 +859,16 @@ bool checkIntersectionEvent(int16_t darkThreshold)
   return retVal;
 }
 
-void handleIntersection(void)
-{
-  Serial.println("Intersection!");
-  beep(true);
+void handleIntersection(void) {
+    Serial.println("Intersection detected!");
+    beep(true);
 
-  //drive forward by dead reckoning to center the robot
-  //chassis.driveFor(8, 5);
-  chassis.setWheelSpeeds(0,0);
-
-  robotState = ROBOT_IDLE;
+    if (robotState == ROBOT_DELIVERY) {
+        chassis.driveFor(7, 10, true); // Assuming chassis.driveFor is blocking
+        evaluateMovement(); // Evaluate next movement after stopping at the intersection
+    } else {
+        robotState = ROBOT_IDLE;
+    }
 }
 
 
@@ -693,14 +882,15 @@ void handleKeyPress(int16_t keyPress)
   switch(robotState)
   {
       case ROBOT_IDLE:
-        // TODO, Section 3.2: Handle up arrow button
-        if(keyPress == UP_ARROW) drive(100, 30);
-        if(keyPress == DOWN_ARROW) drive(-20, 30);
-        if(keyPress == LEFT_ARROW) turn(90, 200);
-        if(keyPress == RIGHT_ARROW) turn(-90, 200);
-        if(keyPress == SETUP_BTN) beginLineFollowing();
-        if(keyPress == REWIND) debug();
+        // // TODO, Section 3.2: Handle up arrow button
+        // if(keyPress == UP_ARROW) drive(100, 30);
+        // if(keyPress == DOWN_ARROW) drive(-20, 30);
+        // if(keyPress == LEFT_ARROW) turn(90, 200);
+        // if(keyPress == RIGHT_ARROW) turn(-90, 200);
+        // if(keyPress == SETUP_BTN) beginLineFollowing();
+        //if(keyPress == REWIND) debug();
         if(keyPress == PLAY_PAUSE) QTR_init();
+        if(keyPress == NUM_8) delivery(target);
 
         else Serial.println("Robot Idle");
         // TODO, Section 6.1: Handle remaining arrows
@@ -721,10 +911,6 @@ void handleKeyPress(int16_t keyPress)
   }
 }
 
-// void PID_control(){
-//   uint16_t positionLine = 
-// }
-
 /*
  * The main loop for the program. The loop function is repeatedly called
  * after setup() is complete.
@@ -738,50 +924,67 @@ void loop()
   // A basic state machine
   switch(robotState)
   {
-    case ROBOT_DRIVE_FOR: 
-      chassis.printEncoderCounts();
-      chassis.printSpeeds();
-      delay(500);
-      // TODO, Section 6.1: Uncomment to handle completed motion
-      if(chassis.checkMotionComplete()) handleMotionComplete(); 
-      Serial.print("Encoder Count: ");
-      chassis.printEncoderCounts();
-      break;
-
-    case ROBOT_LINING:
-      //handleLineFollow(baseSpeed);
+    case ROBOT_DELIVERY:
+      //Serial.println("CASE: ROBOT_DELIVERY");
+      if(keyPress == ENTER_SAVE){
+        idle();
+        Serial.print("Idle key pressed");
+      }
       PID_control();
 
       if(checkIntersectionEvent(darkThreshold)) handleIntersection();
       
-      if(keyPress == ENTER_SAVE){
-        idle();
-        Serial.print("Idle key pressed");
-      }
-      if(keyPress == VOLplus){
-        baseSpeed += 5;
-      }
-      if(keyPress == VOLminus){
-        baseSpeed -= 5;
-      }
+      break;
+
+    // case ROBOT_DRIVE_FOR: 
+    //   Serial.println("CASE: ROBOT_DRIVE_FOR");
+    //   if(keyPress == ENTER_SAVE){
+    //       idle();
+    //       Serial.print("Idle key pressed");
+    //     }
+    //   chassis.printEncoderCounts();
+    //   chassis.printSpeeds();
+    //   delay(500);
+    //   // TODO, Section 6.1: Uncomment to handle completed motion
+    //   if(chassis.checkMotionComplete()) handleMotionComplete(); 
+    //   Serial.print("Encoder Count: ");
+    //   chassis.printEncoderCounts();
+    //   break;
+
+    // case ROBOT_LINING:
+    //   //handleLineFollow(baseSpeed);
+    //   PID_control();
+
+    //   if(checkIntersectionEvent(darkThreshold)) handleIntersection();
       
-      break;
-
-    case ROBOT_DEBUG:
-      if(keyPress == ENTER_SAVE){
-        idle();
-        Serial.print("Idle key pressed");
-      }
-      else debug();
-
-    case ROBOT_IDLE:
-
-      break;
-
-    default:
+    //   if(keyPress == ENTER_SAVE){
+    //     idle();
+    //     Serial.print("Idle key pressed");
+    //   }
+    //   if(keyPress == VOLplus){
+    //     baseSpeed += 5;
+    //   }
+    //   if(keyPress == VOLminus){
+    //     baseSpeed -= 5;
+    //   }
       
-      Serial.println("Unknown State");
-      break;
+    //   break;
+
+    // case ROBOT_DEBUG:
+    //   if(keyPress == ENTER_SAVE){
+    //     idle();
+    //     Serial.print("Idle key pressed");
+    //   }
+    //   else debug();
+
+    // case ROBOT_IDLE:
+
+    //   break;
+
+    // default:
+      
+    //   Serial.println("Unknown State");
+    //   break;
   }
   
 
